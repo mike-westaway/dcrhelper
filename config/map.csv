@@ -1,0 +1,4 @@
+subscriptionId,resourceGroup,vmName,dcrName,pattern,encoding,firstLineRegex,dcrLocation,streamName,destinationAlias,workspaceResourceId
+11111111-1111-1111-1111-111111111111,rg-app-eu,vm-app-01,dcr-app-eu,/var/log/app/*.log,utf-8,.*,westeurope,Custom-AppLogs,laDest,/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/la-workspace-01
+11111111-1111-1111-1111-111111111111,rg-app-eu,vm-app-02,dcr-app-eu,/data/logs/**/*.log,utf-8,.*,westeurope,Custom-AppLogs,laDest,/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/la-workspace-01
+22222222-2222-2222-2222-222222222222,rg-ops-uk,vm-batch-01,dcr-ops-uk,/opt/myapp/logs/**/*.log,utf-8,.*,uksouth,Ops-Stream,opsDest,/subscriptions/22222222-2222-2222-2222-222222222222/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/la-workspace-uk

@@ -1,0 +1,198 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  azureSubscription: 'azure-spn'                # Azure DevOps service connection
+  dcrSubscriptionId: '00000000-0000-0000-0000-000000000000'
+  dcrResourceGroup:  'rg-monitoring'
+  dcrLocationDefault: 'westeurope'
+  laWorkspaceResourceIdDefault: '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/la-workspace-01'
+  streamNameDefault: 'Custom-AppLogs'
+  destinationAliasDefault: 'laDest'
+  mapCsvPath: 'config/map.csv'
+  maxScanFilesPerVm: '200'
+  forceDeployDcr: 'false'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+# 1) Validate CSV
+- stage: Validate_Config
+  jobs:
+    - job: validate
+      steps:
+        - task: PowerShell@2
+          displayName: 'Check map.csv presence & required columns'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $ErrorActionPreference = 'Stop'
+              if (-not (Test-Path "$(mapCsvPath)")) { throw "Missing $(mapCsvPath)" }
+              $map = Import-Csv -Path "$(mapCsvPath)"
+              if ($map.Count -eq 0) { throw "map.csv is empty." }
+              $required = @('subscriptionId','resourceGroup','vmName','dcrName','pattern')
+              foreach ($c in $required) {
+                if (-not ($map | Get-Member -Name $c -MemberType NoteProperty)) { throw "map.csv missing '$c'" }
+              }
+              Write-Host "map.csv OK."
+
+# 2) Scan all VMs
+- stage: Scan_All_VMs
+  dependsOn: Validate_Config
+  jobs:
+    - job: scan
+      steps:
+        - task: AzureCLI@2
+          displayName: 'Run per-VM scan: Windows(PowerShell) / Linux(Bash)'
+          inputs:
+            azureSubscription: '$(azureSubscription)'
+            scriptType: 'ps'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              $ErrorActionPreference = 'Stop'
+              $outDir = "scan_out"
+              New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+              $mapRows = Import-Csv -Path "$(mapCsvPath)"
+              $rowsByVm = $mapRows | Group-Object { "{0}|{1}|{2}" -f $_.subscriptionId, $_.resourceGroup, $_.vmName }
+              $limit = [int]"$(maxScanFilesPerVm)"
+              $total = 0
+
+              $winScript = Get-Content -Raw -Path "scripts/windows_scan.ps1"
+              $bashScript = Get-Content -Raw -Path "scripts/linux_scan.sh"
+
+              foreach ($group in $rowsByVm) {
+                $parts = $group.Name.Split('|')
+                $sub = $parts[0]; $rg = $parts[1]; $vm = $parts[2]
+                az account set --subscription $sub | Out-Null
+
+                $patterns = $group.Group | Select-Object -ExpandProperty pattern | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique
+                if (-not $patterns -or $patterns.Count -eq 0) { Write-Warning "No patterns for $rg/$vm"; continue }
+
+                $osType = az vm show --resource-group $rg --name $vm --query "storageProfile.osDisk.osType" -o tsv
+                if (-not $osType) { $osType = "Linux" }
+
+                Write-Host "Scanning $sub/$rg/$vm (OS=$osType) patterns: $($patterns -join ', ')"
+
+                if ($osType -eq "Windows") {
+                  $result = az vm run-command invoke --resource-group $rg --name $vm `
+                    --command-id RunPowerShellScript `
+                    --scripts $winScript `
+                    --parameters "patterns=$($patterns -join ' ')" "limit=$limit" `
+                    --query "value[0].message" -o tsv
+                } else {
+                  $joined = ($patterns -join '|')
+                  $result = az vm run-command invoke --resource-group $rg --name $vm `
+                    --command-id RunShellScript `
+                    --scripts "cat >/tmp/linux_scan.sh <<'EOF'\n$bashScript\nEOF\nbash /tmp/linux_scan.sh '$joined' $limit" `
+                    --query "value[0].message" -o tsv
+                }
+
+                $last = ($result -split "`n")[-1]
+                try {
+                  $json = $last | ConvertFrom-Json
+                  $cnt = [int]$json.count
+                  $total += $cnt
+                  $outPath = Join-Path $outDir ("{0}_{1}_scan.json" -f $rg, $vm)
+                  ($json | ConvertTo-Json -Depth 10) | Set-Content -Path $outPath
+                  Write-Host "Saved $outPath (count=$cnt)"
+                } catch {
+                  Write-Warning "Non-JSON output for $rg/$vm; saving raw."
+                  Set-Content -Path (Join-Path $outDir ("{0}_{1}_raw.txt" -f $rg, $vm)) -Value $result
+                }
+              }
+
+              Write-Host "##vso[task.setvariable variable=totalScanMatches]$total"
+              Write-Host "Total scan matches: $total"
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish scan artifacts'
+          inputs:
+            pathToPublish: 'scan_out'
+            artifactName: 'vm-scans'
+            publishLocation: 'Container'
+
+# 3) Build & deploy DCRs + associate VMs
+- stage: Build_And_Deploy_DCRs
+  dependsOn: Scan_All_VMs
+  condition: or(eq(variables['forceDeployDcr'], 'true'), gt(variables['totalScanMatches'], '0'))
+  jobs:
+    - job: dcr
+      steps:
+        - task: AzureCLI@2
+          displayName: 'Generate dcr_out/*.json (per dcrName)'
+          inputs:
+            azureSubscription: '$(azureSubscription)'
+            scriptType: 'ps'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              & "scripts/build_dcr.ps1" `
+                -mapCsvPath "$(mapCsvPath)" `
+                -outDir "dcr_out" `
+                -dcrLocationDefault "$(dcrLocationDefault)" `
+                -streamNameDefault "$(streamNameDefault)" `
+                -destAliasDefault "$(destinationAliasDefault)" `
+                -laWorkspaceResourceIdDefault "$(laWorkspaceResourceIdDefault)"
+
+        - task: AzureCLI@2
+          displayName: 'Deploy each DCR (ARM group deployments)'
+          inputs:
+            azureSubscription: '$(azureSubscription)'
+            scriptType: 'ps'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              $ErrorActionPreference = 'Stop'
+              az account set --subscription "$(dcrSubscriptionId)" | Out-Null
+              $files = Get-ChildItem -Path "dcr_out" -Filter "dcr_*.json"
+              if ($files.Count -eq 0) { throw "No DCR payloads" }
+
+              foreach ($f in $files) {
+                $dcrName = $f.BaseName.Substring(4)
+                $tmplPath = Join-Path "dcr_out" ("deploy_{0}.json" -f $dcrName)
+                $props = Get-Content -Raw -Path $f.FullName
+
+                @"
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "resources": [
+    {
+      "type": "Microsoft.Insights/dataCollectionRules",
+      "apiVersion": "2022-06-01",
+      "name": "$dcrName",
+      "location": "$(dcrLocationDefault)",
+      "properties": $props
+    }
+  ]
+}
+"@ | Set-Content -Path $tmplPath
+
+                $state = az deployment group create `
+                  --resource-group "$(dcrResourceGroup)" `
+                  --name "dcr-$dcrName-$(Get-Date -UFormat %s)" `
+                  --template-file $tmplPath `
+                  --query "properties.provisioningState" -o tsv
+                Write-Host "Deployed $dcrName (state=$state)"
+              }
+
+        - task: AzureCLI@2
+          displayName: 'Install AMA and associate VMs'
+          inputs:
+            azureSubscription: '$(azureSubscription)'
+            scriptType: 'ps'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              & "scripts/associate.ps1" `
+                -mapCsvPath "$(mapCsvPath)" `
+                -dcrSubscriptionId "$(dcrSubscriptionId)" `
+                -dcrResourceGroup "$(dcrResourceGroup)"
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish DCR payloads'
+          inputs:
+            pathToPublish: 'dcr_out'
+            artifactName: 'dcrs'
+            publishLocation: 'Container'
